@@ -1,0 +1,155 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Wheelie Rush Recovery V3</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#10151d;color:white;font-family:system-ui;overflow:hidden}canvas{display:block;width:100vw;height:58vh;background:linear-gradient(#63b7ff,#d8f2ff)}
+#ui{height:42vh;background:#151b24;padding:8px;overflow:auto}select,button,input{font:700 15px system-ui}select{width:100%;padding:9px;border-radius:8px}
+.row{display:flex;gap:7px;align-items:center;margin-top:8px;flex-wrap:wrap}button{padding:10px 13px;border:0;border-radius:9px;background:#e7edf4}button:active{transform:scale(.96)}
+#start{background:#69e675}#gas{width:min(520px,100%);flex:1}.box{background:#0008;border-radius:8px;padding:6px 9px}
+#status{font-weight:900;color:#9dff8b}.tiny{font-size:12px;opacity:.8}
+</style></head>
+<body><canvas id="game"></canvas><div id="ui">
+<select id="bike"></select>
+<div class="row"><button id="start">🔑 START</button><button id="down">− GEAR</button><button id="up">+ GEAR</button><button id="brake">BRAKE</button><span id="gear" class="box">N</span></div>
+<div class="row"><b>THROTTLE</b><input id="gas" type="range" min="0" max="100" value="0"><b id="pct">0%</b></div>
+<div id="status" class="box">ENGINE OFF • N • 0.0 MPH</div>
+<div class="tiny">RECOVERY V3: working V2 checkpoint + throttle wheelie physics.</div>
+</div>
+<script>
+const C=document.querySelector('#game'),g=C.getContext('2d'),S=document.querySelector('#bike'),gas=document.querySelector('#gas');
+const bikes=[
+ {name:'60cc Mini',cc:60,max:48,color:'#ffca28'},{name:'85cc Mini MX',cc:85,max:62,color:'#ff7043'},
+ {name:'110cc Pit Bike',cc:110,max:68,color:'#42a5f5'},{name:'125cc Two-Stroke',cc:125,max:78,color:'#66bb6a'},
+ {name:'150cc MX',cc:150,max:82,color:'#ab47bc'},{name:'250cc Race Bike',cc:250,max:94,color:'#ef5350'},
+ {name:'450cc Factory MX',cc:450,max:108,color:'#26c6da'},{name:'500cc Two-Stroke Custom',cc:500,max:116,color:'#ffa726'}
+];
+bikes.forEach((b,i)=>S.add(new Option(`[${b.cc}cc] ${b.name}`,i)));
+let running=false,gear=0,speed=0,rpm=0,last=performance.now(),scroll=0,audio=null,lastSel=0;
+let brakeHeld=false,suspF=0,suspR=0,suspFV=0,suspRV=0,chassisPitch=0;
+let wheelieAngle=0,wheelieVel=0,crashed=false;
+
+function resize(){C.width=innerWidth*devicePixelRatio;C.height=innerHeight*.58*devicePixelRatio;g.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0)}
+addEventListener('resize',resize);resize();
+function bike(){return bikes[Number(S.value)||0]}
+function syncSelection(){let n=Number(S.value)||0;if(n!==lastSel){lastSel=n;running=false;gear=0;speed=0;rpm=0;gas.value=0;suspF=suspR=suspFV=suspRV=chassisPitch=0;wheelieAngle=wheelieVel=0;crashed=false;stopSound();update()}}
+S.oninput=syncSelection;S.onchange=syncSelection;
+
+function audioOn(){if(!audio){let a=new (AudioContext||webkitAudioContext)(),o=a.createOscillator(),o2=a.createOscillator(),gain=a.createGain(),f=a.createBiquadFilter();o.type='sawtooth';o2.type='square';o.connect(f);o2.connect(f);f.connect(gain);gain.connect(a.destination);gain.gain.value=0;o.start();o2.start();audio={a,o,o2,gain,f}}audio.a.resume()}
+function stopSound(){if(audio)audio.gain.gain.setTargetAtTime(0,audio.a.currentTime,.03)}
+function sound(){
+ if(!audio)return;let b=bike(),t=audio.a.currentTime;
+ let idle=b.cc<=85?2100:b.cc<=150?1800:b.cc<=250?1550:1250;
+ let red=b.cc<=85?12500:b.cc<=150?11500:b.cc<=250?10300:b.cc<=450?9300:8500;
+ let p=Number(gas.value)/100;
+ rpm=running?Math.max(idle,Math.min(red,idle+(red-idle)*(speed/b.max*.72+p*.28))):0;
+ let fire=Math.max(24,rpm/60)*(b.cc<=150?.5:1);
+ audio.o.frequency.setTargetAtTime(fire,t,.025);audio.o2.frequency.setTargetAtTime(fire*(b.cc<=150?3.02:1.51),t,.025);
+ audio.f.type='lowpass';audio.f.frequency.setTargetAtTime(b.cc<=150?4800:2600,t,.04);
+ audio.gain.gain.setTargetAtTime(running?.14:0,t,.03);
+}
+document.querySelector('#start').onclick=()=>{
+ audioOn();
+ if(crashed){crashed=false;wheelieAngle=wheelieVel=0;speed=0;gear=1;running=true;gas.value=0}
+ else{running=!running;if(running&&gear===0)gear=1}
+ if(!running)stopSound();update()
+};
+document.querySelector('#up').onclick=()=>{if(running&&!crashed)gear=Math.min(6,Math.max(1,gear+1));update()};
+document.querySelector('#down').onclick=()=>{if(crashed)return;gear=Math.max(0,gear-1);update()};
+gas.oninput=update;
+const brakeBtn=document.querySelector('#brake');
+function brakeOn(e){if(e)e.preventDefault();brakeHeld=true}
+function brakeOff(e){if(e)e.preventDefault();brakeHeld=false}
+brakeBtn.addEventListener('pointerdown',brakeOn);
+brakeBtn.addEventListener('pointerup',brakeOff);
+brakeBtn.addEventListener('pointercancel',brakeOff);
+brakeBtn.addEventListener('pointerleave',brakeOff);
+
+function update(){
+ let b=bike(),p=+gas.value;
+ document.querySelector('#pct').textContent=p+'%';document.querySelector('#gear').textContent=gear?`G${gear}`:'N';
+ document.querySelector('#start').textContent=running?'🛑 STOP':'🔑 START';
+ document.querySelector('#status').textContent=crashed
+ ?`💥 CRASHED • ${b.cc}cc • Tap START to reset`
+ :`ACTIVE ${b.cc}cc • ENGINE ${running?'ON':'OFF'} • G${gear} • GAS ${p}% • ${speed.toFixed(1)} MPH${wheelieAngle>.08?' • WHEELIE '+Math.round(wheelieAngle*57.3)+'°':''}`;
+}
+function drawBike(b,x,y,sf=0,sr=0,pitch=0){
+ let cc=b.cc,sc=cc<=85?.72:cc<=125?.82:cc<=150?.88:cc<=250?1:cc<=450?1.08:1.13;
+ let wb=cc<=85?92:cc<=125?108:cc<=150?116:cc<=250?126:cc<=450?136:143,wr=cc<=85?19:cc<=150?23:cc<=250?26:28;
+ g.save();g.translate(x,y);g.rotate(pitch);g.scale(sc,sc);
+ let rx=-wb/2,fx=wb/2,rearY=20+sr,frontY=20+sf;
+ for(let X of [rx,fx]){let wy=X===rx?rearY:frontY;g.fillStyle='#151515';g.beginPath();g.arc(X,wy,wr,0,7);g.fill();g.strokeStyle='#bbb';g.lineWidth=2;g.beginPath();g.arc(X,wy,wr-7,0,7);g.stroke()}
+ g.strokeStyle='#aaa';g.lineWidth=6;g.beginPath();g.moveTo(rx,rearY);g.lineTo(-13,-5);g.lineTo(24,-27);g.lineTo(fx,frontY);g.stroke();
+ g.strokeStyle='#d7b84b';g.lineWidth=7;g.beginPath();g.moveTo(24,-27);g.lineTo(fx,frontY-4);g.stroke();
+ g.strokeStyle='#f1d33f';g.lineWidth=4;g.beginPath();for(let i=0;i<7;i++){let yy=-17+i*(4+sr*.04);g.lineTo(-17+(i%2?5:-5),yy)}g.stroke();
+ // detailed engine size changes with cc
+ let ew=cc<=125?29:cc<=250?36:44,eh=cc<=125?27:cc<=250?33:39;
+ g.fillStyle='#555';g.fillRect(-ew/2,-8,ew,eh);g.strokeStyle='#222';g.lineWidth=2;
+ for(let yy=-5;yy<9;yy+=4){g.beginPath();g.moveTo(-ew/2-3,yy);g.lineTo(ew/2+3,yy);g.stroke()}
+ // genuinely different bodies
+ g.fillStyle=b.color;
+ if(cc<=85){g.beginPath();g.ellipse(-3,-28,25,12,0,0,7);g.fill();g.fillRect(-47,-38,42,7)}
+ else if(cc<=125){g.beginPath();g.moveTo(-31,-31);g.lineTo(18,-39);g.lineTo(35,-24);g.lineTo(8,-14);g.lineTo(-34,-17);g.fill();g.fillStyle='#111';g.fillRect(-54,-41,59,8)}
+ else if(cc<=150){g.beginPath();g.moveTo(-35,-33);g.lineTo(20,-42);g.lineTo(42,-25);g.lineTo(17,-10);g.lineTo(-38,-15);g.fill();g.fillStyle='#111';g.fillRect(-59,-43,67,8)}
+ else if(cc<=250){g.beginPath();g.moveTo(-39,-35);g.lineTo(22,-44);g.lineTo(48,-27);g.lineTo(26,-7);g.lineTo(-41,-14);g.fill();g.fillStyle='#111';g.fillRect(-64,-45,75,9)}
+ else {g.beginPath();g.moveTo(-44,-38);g.lineTo(25,-48);g.lineTo(54,-29);g.lineTo(31,-5);g.lineTo(-46,-13);g.fill();g.fillStyle='#111';g.fillRect(-70,-48,84,10)}
+ g.fillStyle=b.color;g.fillRect(rx-25,-34,40+(cc/30),6);g.fillRect(fx-5,-28,30+(cc/50),6);
+ g.fillStyle='#222';g.beginPath();g.arc(-8,-63,11,0,7);g.fill();g.strokeStyle='#222';g.lineWidth=9;g.beginPath();g.moveTo(-8,-52);g.lineTo(12,-36);g.lineTo(31,-42);g.stroke();
+ g.fillStyle='#fff';g.font='bold 10px system-ui';g.fillText(cc+'cc',-18,-20);g.restore();
+}
+function frame(now){
+ // selectedIndex/value is source of truth every frame
+ syncSelection();
+ let dt=Math.min(.035,(now-last)/1000);last=now,b=bike(),p=(+gas.value||0)/100;
+ if(running&&gear>0&&p>0){
+   let caps=[0,.26,.43,.60,.75,.89,1],target=b.max*caps[gear]*(.12+.88*p);
+   let response=b.cc<=85?2.6:b.cc<=150?3:b.cc<=250?3.5:4;
+   speed+=Math.max(8,(target-speed)*response)*dt;
+   if(speed>target)speed+=(target-speed)*3*dt;
+ }else speed=Math.max(0,speed-8*dt);
+ let accelInput=(running&&gear>0)?p:0;
+ let targetF=(brakeHeld&&speed>1)?7.5:-accelInput*1.2;
+ let targetR=accelInput*5.8-(brakeHeld&&speed>1?1.8:0);
+ let k=38,c=12;
+ suspFV+=(targetF-suspF)*k*dt-suspFV*c*dt;
+ suspRV+=(targetR-suspR)*k*dt-suspRV*c*dt;
+ suspF=Math.max(-7,Math.min(9,suspF+suspFV*dt));
+ suspR=Math.max(-7,Math.min(9,suspR+suspRV*dt));
+ let targetPitch=Math.max(-.12,Math.min(.12,(suspR-suspF)*.012));
+ chassisPitch+=(targetPitch-chassisPitch)*Math.min(1,dt*7);
+ if(brakeHeld&&speed>0)speed=Math.max(0,speed-(34+speed*.16)*dt);
+
+ // RECOVERY V3 WHEELIE PHYSICS — isolated from the working drivetrain.
+ // Power can lift the front only while the engine is running, in gear, moving, and on throttle.
+ if(!crashed){
+   let cc=b.cc;
+   let power=cc<=85?.68:cc<=125?.78:cc<=150?.86:cc<=250?1.0:cc<=450?1.13:1.20;
+   let speedFactor=Math.max(0,1-Math.max(0,speed-58)/90);
+   let lift=(running&&gear>0&&speed>3)?Math.max(0,p-.30)*power*1.72*speedFactor:0;
+   // Gravity/restoring force grows as the nose rises. Releasing gas always lets it fall.
+   let gravity=.42+wheelieAngle*.92;
+   // Rear brake / brake button aggressively brings the front down.
+   let brakeDrop=brakeHeld?1.35:0;
+   // First gear has more lift; taller gears progressively less.
+   let gearLift=gear===1?1.18:gear===2?1.0:gear===3?.82:.62;
+   wheelieVel+=(lift*gearLift-gravity-brakeDrop)*dt;
+   wheelieVel*=Math.pow(.965,dt*60);
+   wheelieAngle+=wheelieVel*dt;
+   if(wheelieAngle<0){wheelieAngle=0;if(wheelieVel<0)wheelieVel=0}
+   // About 69 degrees = loop-out threshold.
+   if(wheelieAngle>1.20){
+     crashed=true;running=false;wheelieAngle=1.28;wheelieVel=0;speed*=.45;stopSound();
+   }
+ }else{
+   speed=Math.max(0,speed-26*dt);
+ }
+
+ scroll+=speed*dt*18;sound();update();
+ let w=innerWidth,h=innerHeight*.58;
+ g.clearRect(0,0,w,h);g.fillStyle='#7bc5ff';g.fillRect(0,0,w,h*.68);g.fillStyle='#3e444b';g.fillRect(0,h*.68,w,h*.32);
+ g.strokeStyle='#fff';g.lineWidth=4;g.setLineDash([40,35]);g.beginPath();g.moveTo(-(scroll%75),h*.83);g.lineTo(w,h*.83);g.stroke();g.setLineDash([]);
+ drawBike(b,w*.43,h*.68-42,suspF,suspR,chassisPitch-wheelieAngle);
+ if(crashed){g.fillStyle='#ff3b30';g.font='900 30px system-ui';g.textAlign='center';g.fillText('💥 LOOPED OUT!',w*.5,55);g.font='700 14px system-ui';g.fillText('Tap START to reset',w*.5,80);g.textAlign='start'}
+ requestAnimationFrame(frame)
+}
+update();requestAnimationFrame(frame);
+</script></body></html>
